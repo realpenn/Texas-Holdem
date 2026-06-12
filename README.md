@@ -20,7 +20,8 @@ go run ./cmd/bot
 - `/balance` 查询余额
 - `/checkin` 每日签到
 - `/redeem CODE` 兑换充值码
-- `/fold` `/check` `/call` `/raise AMOUNT` `/allin` 行动命令
+
+牌局行动通过群内按钮完成。
 
 管理员私聊命令：
 

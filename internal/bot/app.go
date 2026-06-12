@@ -109,15 +109,6 @@ func (a *App) handleMessage(ctx context.Context, m *tgbotapi.Message) {
 		a.cmdCheckin(ctx, m)
 	case "redeem":
 		a.cmdRedeem(ctx, m, args)
-	case "fold", "check", "call", "allin":
-		a.cmdAction(ctx, m, poker.ActionKind(cmd), 0)
-	case "raise":
-		amount, err := parseIntArg(args, 0)
-		if err != nil {
-			a.reply(m.Chat.ID, m.MessageID, "用法：/raise 加注到的总额，例如 /raise 300")
-			return
-		}
-		a.cmdAction(ctx, m, poker.ActionRaise, amount)
 	}
 }
 
@@ -354,15 +345,6 @@ func (a *App) cmdRedeem(ctx context.Context, m *tgbotapi.Message, args []string)
 	a.reply(m.Chat.ID, m.MessageID, fmt.Sprintf("兑换成功，获得 %d，当前余额 %d。", amount, bal))
 }
 
-func (a *App) cmdAction(ctx context.Context, m *tgbotapi.Message, kind poker.ActionKind, amount int64) {
-	active, err := a.store.ActiveGame(ctx, m.Chat.ID)
-	if err != nil || active.Game.Status != poker.StatusRunning {
-		a.reply(m.Chat.ID, m.MessageID, "当前没有进行中的牌局。")
-		return
-	}
-	a.applyAction(ctx, active.Game, m.From.ID, kind, amount)
-}
-
 func (a *App) handleCallback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 	if q.Message == nil || q.From == nil {
 		return
@@ -582,11 +564,6 @@ func (a *App) setCommands() {
 		tgbotapi.BotCommand{Command: "balance", Description: "查询余额"},
 		tgbotapi.BotCommand{Command: "checkin", Description: "每日签到"},
 		tgbotapi.BotCommand{Command: "redeem", Description: "兑换充值码"},
-		tgbotapi.BotCommand{Command: "fold", Description: "弃牌"},
-		tgbotapi.BotCommand{Command: "check", Description: "过牌"},
-		tgbotapi.BotCommand{Command: "call", Description: "跟注"},
-		tgbotapi.BotCommand{Command: "raise", Description: "加注到指定总额"},
-		tgbotapi.BotCommand{Command: "allin", Description: "全下"},
 	)
 	if _, err := a.api.Request(commands); err != nil {
 		a.log.Warn("set commands failed", "error", err)

@@ -229,7 +229,7 @@ func (g *Game) ApplyAction(userID int64, kind ActionKind, amount int64) (ActionR
 		}
 		needed := amount - p.CurrentBet
 		if needed > p.Stack {
-			return ActionResult{}, errors.New("筹码不足；可以使用 /allin")
+			return ActionResult{}, errors.New("筹码不足；可以点击 All-in")
 		}
 		raiseBy := amount - g.CurrentBet
 		if raiseBy < g.MinRaise && needed != p.Stack {
