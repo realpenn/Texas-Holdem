@@ -59,8 +59,7 @@ CREATE TABLE IF NOT EXISTS redemptions (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     amount INTEGER NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(code, chat_id, user_id)
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS checkins (

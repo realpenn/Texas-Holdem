@@ -8,7 +8,9 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"texas-holdem/internal/blackjack"
 	"texas-holdem/internal/poker"
+	"texas-holdem/internal/store"
 )
 
 func waitingText(game *poker.Game, deadline time.Time) string {
@@ -74,6 +76,15 @@ func waitingKeyboard(gameID string) tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
+func gameSelectKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("德州扑克", "select:"+store.GameTypeHoldem),
+			tgbotapi.NewInlineKeyboardButtonData("21点", "select:"+store.GameTypeBlackjack),
+		),
+	)
+}
+
 func actionKeyboard(game *poker.Game) tgbotapi.InlineKeyboardMarkup {
 	buttons := [][]tgbotapi.InlineKeyboardButton{
 		{
@@ -96,6 +107,59 @@ func actionKeyboard(game *poker.Game) tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("过牌", "act:"+game.ID+":check"),
 			tgbotapi.NewInlineKeyboardButtonData("最小加注", "act:"+game.ID+":raise"),
 			tgbotapi.NewInlineKeyboardButtonData("All-in", "act:"+game.ID+":allin"),
+		))
+	}
+	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
+}
+
+func blackjackWaitingText(game *blackjack.Game, deadline time.Time) string {
+	names := make([]string, 0, len(game.Players))
+	for _, p := range game.Players {
+		names = append(names, p.Display)
+	}
+	return fmt.Sprintf("21点等待中\n下注：%d\n人数：%d/7\n玩家：%s\n自动开局：%s",
+		game.Bet, len(game.Players), strings.Join(names, "、"), deadline.Format("15:04:05"))
+}
+
+func blackjackGameText(game *blackjack.Game, deadline time.Time) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "庄家明牌：%s\n", boardText(game.DealerVisibleCards()))
+	for _, p := range game.Players {
+		marker := " "
+		if current := game.CurrentPlayer(); current != nil && current.UserID == p.UserID {
+			marker = ">"
+		}
+		fmt.Fprintf(&b, "%s %s：%s（%d点，%s）\n", marker, p.Display, poker.CardsString(p.Hand), blackjack.HandValue(p.Hand), blackjackPlayerStatus(p.Status))
+	}
+	if current := game.CurrentPlayer(); current != nil {
+		fmt.Fprintf(&b, "轮到：%s，截止 %s", current.Display, deadline.Format("15:04:05"))
+	}
+	return b.String()
+}
+
+func blackjackSettlementText(game *blackjack.Game) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "21点结束\n庄家：%s（%d点）\n玩家手牌：\n", poker.CardsString(game.Dealer), blackjack.HandValue(game.Dealer))
+	for _, p := range game.Players {
+		fmt.Fprintf(&b, "%s：%s（%d点，%s）\n", p.Display, poker.CardsString(p.Hand), blackjack.HandValue(p.Hand), blackjackPlayerStatus(p.Status))
+	}
+	for _, award := range game.Awards {
+		name := blackjackPlayerName(game, award.UserID)
+		fmt.Fprintf(&b, "%s：下注 %d，返还 %d，净输赢 %+d（%s）\n", name, award.Bet, award.Payout, award.Net, award.Reason)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func blackjackActionKeyboard(game *blackjack.Game) tgbotapi.InlineKeyboardMarkup {
+	buttons := [][]tgbotapi.InlineKeyboardButton{
+		{
+			tgbotapi.NewInlineKeyboardButtonData("看牌", "bjhand:"+game.ID),
+		},
+	}
+	if game.CurrentPlayer() != nil {
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("要牌", "bjact:"+game.ID+":hit"),
+			tgbotapi.NewInlineKeyboardButtonData("停牌", "bjact:"+game.ID+":stand"),
 		))
 	}
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
@@ -161,6 +225,98 @@ func playerName(game *poker.Game, userID int64) string {
 		}
 	}
 	return strconv.FormatInt(userID, 10)
+}
+
+func blackjackPlayerName(game *blackjack.Game, userID int64) string {
+	for _, p := range game.Players {
+		if p.UserID == userID {
+			return p.Display
+		}
+	}
+	return strconv.FormatInt(userID, 10)
+}
+
+func blackjackPlayerHand(game *blackjack.Game, userID int64) ([]poker.Card, bool) {
+	for _, p := range game.Players {
+		if p.UserID == userID {
+			return append([]poker.Card(nil), p.Hand...), len(p.Hand) > 0
+		}
+	}
+	return nil, false
+}
+
+func blackjackPlayerStatus(status string) string {
+	switch status {
+	case blackjack.PlayerWaiting:
+		return "等待"
+	case blackjack.PlayerActive:
+		return "行动中"
+	case blackjack.PlayerStand:
+		return "停牌"
+	case blackjack.PlayerBust:
+		return "爆牌"
+	case blackjack.PlayerBlackjack:
+		return "Blackjack"
+	default:
+		return status
+	}
+}
+
+func activeID(active store.ActiveGame) string {
+	if active.Type == store.GameTypeBlackjack && active.Blackjack != nil {
+		return active.Blackjack.ID
+	}
+	if active.Game != nil {
+		return active.Game.ID
+	}
+	return ""
+}
+
+func activeChatID(active store.ActiveGame) int64 {
+	if active.Type == store.GameTypeBlackjack && active.Blackjack != nil {
+		return active.Blackjack.ChatID
+	}
+	if active.Game != nil {
+		return active.Game.ChatID
+	}
+	return 0
+}
+
+func activeCreatorID(active store.ActiveGame) int64 {
+	if active.Type == store.GameTypeBlackjack && active.Blackjack != nil {
+		return active.Blackjack.CreatorID
+	}
+	if active.Game != nil {
+		return active.Game.CreatorID
+	}
+	return 0
+}
+
+func activeStatus(active store.ActiveGame) string {
+	if active.Type == store.GameTypeBlackjack && active.Blackjack != nil {
+		return active.Blackjack.Status
+	}
+	if active.Game != nil {
+		return active.Game.Status
+	}
+	return ""
+}
+
+func parseGameType(args []string) (string, []string) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	switch strings.ToLower(args[0]) {
+	case "holdem", "texas", "poker", "德州", "德州扑克":
+		return store.GameTypeHoldem, args[1:]
+	case "blackjack", "bj", "21", "21点", "二十一点":
+		return store.GameTypeBlackjack, args[1:]
+	default:
+		if _, err := strconv.ParseInt(args[0], 10, 64); err == nil {
+			return store.GameTypeHoldem, args
+		}
+		return "", args
+	}
 }
 
 func parsePositiveOr(raw string, fallback int64) int64 {
