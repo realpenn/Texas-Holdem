@@ -540,12 +540,12 @@ func (a *App) handleCallback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 			a.answerCallback(q.ID, "这不是21点牌局", true)
 			return
 		}
-		hand, ok := blackjackPlayerHand(game, q.From.ID)
+		hand, ok := blackjackPlayerHandText(game, q.From.ID)
 		if !ok {
 			a.answerCallback(q.ID, "你不在本局，或尚未发牌", true)
 			return
 		}
-		a.answerCallback(q.ID, fmt.Sprintf("你的手牌：%s（%d点）", poker.CardsString(hand), blackjack.HandValue(hand)), true)
+		a.answerCallback(q.ID, "你的手牌："+hand, true)
 	case "bjact":
 		game := active.Blackjack
 		if game == nil {
@@ -643,7 +643,7 @@ func (a *App) startWaitingBlackjack(ctx context.Context, active store.ActiveGame
 			a.send(game.ChatID, "21点开局失败："+err.Error(), nil)
 			return
 		}
-		if err := a.store.FinishBlackjack(ctx, game); err != nil {
+		if err := a.store.FinishBlackjack(ctx, game, 0, 0); err != nil {
 			a.send(game.ChatID, "21点结算失败："+err.Error(), nil)
 			return
 		}
@@ -690,6 +690,18 @@ func (a *App) applyAction(ctx context.Context, game *poker.Game, userID int64, k
 }
 
 func (a *App) applyBlackjackAction(ctx context.Context, game *blackjack.Game, userID int64, kind blackjack.ActionKind) {
+	extraBet := game.ExtraBetCost(userID, kind)
+	if extraBet > 0 {
+		bal, err := a.store.Balance(ctx, game.ChatID, userID)
+		if err != nil {
+			a.send(game.ChatID, "读取余额失败："+err.Error(), nil)
+			return
+		}
+		if bal < extraBet {
+			a.send(game.ChatID, fmt.Sprintf("%s 余额不足，无法%s（需要 %d，当前 %d）。", blackjackPlayerName(game, userID), blackjackActionLabel(kind), extraBet, bal), nil)
+			return
+		}
+	}
 	result, err := game.ApplyAction(userID, kind)
 	if err != nil {
 		a.send(game.ChatID, err.Error(), nil)
@@ -697,7 +709,7 @@ func (a *App) applyBlackjackAction(ctx context.Context, game *blackjack.Game, us
 	}
 	text := strings.Join(result.Messages, "\n")
 	if result.Finished {
-		if err := a.store.FinishBlackjack(ctx, game); err != nil {
+		if err := a.store.FinishBlackjack(ctx, game, userID, extraBet); err != nil {
 			a.send(game.ChatID, "21点结算失败："+err.Error(), nil)
 			return
 		}
@@ -709,7 +721,7 @@ func (a *App) applyBlackjackAction(ctx context.Context, game *blackjack.Game, us
 		return
 	}
 	deadline := time.Now().Add(time.Duration(game.ActionSeconds) * time.Second)
-	if err := a.store.SaveRunningBlackjack(ctx, game, deadline, userID, string(kind), "{}"); err != nil {
+	if err := a.store.SaveRunningBlackjack(ctx, game, deadline, userID, string(kind), "{}", extraBet); err != nil {
 		a.send(game.ChatID, "保存21点失败："+err.Error(), nil)
 		return
 	}
@@ -790,13 +802,13 @@ func (a *App) handleBlackjackTimeout(ctx context.Context, fresh store.ActiveGame
 		return
 	}
 	if result.Finished {
-		if err := a.store.FinishBlackjack(ctx, fresh.Blackjack); err == nil {
+		if err := a.store.FinishBlackjack(ctx, fresh.Blackjack, 0, 0); err == nil {
 			a.send(fresh.Blackjack.ChatID, strings.Join(result.Messages, "\n")+"\n"+blackjackSettlementText(fresh.Blackjack), nil)
 		}
 		return
 	}
 	deadline := time.Now().Add(time.Duration(fresh.Blackjack.ActionSeconds) * time.Second)
-	if err := a.store.SaveRunningBlackjack(ctx, fresh.Blackjack, deadline, 0, "timeout", "{}"); err == nil {
+	if err := a.store.SaveRunningBlackjack(ctx, fresh.Blackjack, deadline, 0, "timeout", "{}", 0); err == nil {
 		a.send(fresh.Blackjack.ChatID, strings.Join(result.Messages, "\n")+"\n"+blackjackGameText(fresh.Blackjack, deadline.In(a.cfg.Location)), blackjackActionKeyboard(fresh.Blackjack))
 	}
 }

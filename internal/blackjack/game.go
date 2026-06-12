@@ -18,6 +18,9 @@ const (
 	PlayerStand     = "stand"
 	PlayerBust      = "bust"
 	PlayerBlackjack = "blackjack"
+
+	// DeckCount 副牌洗在一起，避免多人局把单副牌抽空。
+	DeckCount = 4
 )
 
 type Settings struct {
@@ -29,13 +32,40 @@ type Settings struct {
 	ActionSeconds int    `json:"action_seconds"`
 }
 
-type Player struct {
-	UserID  int64        `json:"user_id"`
-	Display string       `json:"display"`
-	Seat    int          `json:"seat"`
+type Hand struct {
+	Cards   []poker.Card `json:"cards"`
 	Bet     int64        `json:"bet"`
 	Status  string       `json:"status"`
-	Hand    []poker.Card `json:"hand"`
+	Doubled bool         `json:"doubled"`
+}
+
+type Player struct {
+	UserID  int64  `json:"user_id"`
+	Display string `json:"display"`
+	Seat    int    `json:"seat"`
+	Hands   []Hand `json:"hands"`
+}
+
+func (p *Player) TotalBet() int64 {
+	var total int64
+	for _, h := range p.Hands {
+		total += h.Bet
+	}
+	return total
+}
+
+func (p *Player) SummaryStatus() string {
+	if len(p.Hands) == 1 {
+		return p.Hands[0].Status
+	}
+	out := ""
+	for i, h := range p.Hands {
+		if i > 0 {
+			out += "/"
+		}
+		out += h.Status
+	}
+	return out
 }
 
 type Game struct {
@@ -45,6 +75,7 @@ type Game struct {
 	Deck        []poker.Card `json:"deck"`
 	Dealer      []poker.Card `json:"dealer"`
 	CurrentTurn int          `json:"current_turn"`
+	CurrentHand int          `json:"current_hand"`
 	Awards      []Award      `json:"awards"`
 }
 
@@ -59,8 +90,10 @@ type Award struct {
 type ActionKind string
 
 const (
-	ActionHit   ActionKind = "hit"
-	ActionStand ActionKind = "stand"
+	ActionHit    ActionKind = "hit"
+	ActionStand  ActionKind = "stand"
+	ActionDouble ActionKind = "double"
+	ActionSplit  ActionKind = "split"
 )
 
 type ActionResult struct {
@@ -90,8 +123,7 @@ func (g *Game) AddPlayer(userID int64, display string) error {
 		UserID:  userID,
 		Display: display,
 		Seat:    len(g.Players),
-		Bet:     g.Bet,
-		Status:  PlayerWaiting,
+		Hands:   []Hand{{Bet: g.Bet, Status: PlayerWaiting}},
 	})
 	return nil
 }
@@ -118,7 +150,10 @@ func (g *Game) Start() error {
 	if len(g.Players) < 1 {
 		return errors.New("至少需要 1 人开局")
 	}
-	deck := poker.NewDeck()
+	deck := make([]poker.Card, 0, 52*DeckCount)
+	for i := 0; i < DeckCount; i++ {
+		deck = append(deck, poker.NewDeck()...)
+	}
 	if err := poker.Shuffle(deck); err != nil {
 		return err
 	}
@@ -126,8 +161,7 @@ func (g *Game) Start() error {
 	g.Status = StatusRunning
 	g.Dealer = nil
 	for i := range g.Players {
-		g.Players[i].Status = PlayerActive
-		g.Players[i].Hand = nil
+		g.Players[i].Hands = []Hand{{Bet: g.Bet, Status: PlayerActive}}
 	}
 	for cardNo := 0; cardNo < 2; cardNo++ {
 		for i := range g.Players {
@@ -135,7 +169,7 @@ func (g *Game) Start() error {
 			if err != nil {
 				return err
 			}
-			g.Players[i].Hand = append(g.Players[i].Hand, card)
+			g.Players[i].Hands[0].Cards = append(g.Players[i].Hands[0].Cards, card)
 		}
 		card, err := g.draw()
 		if err != nil {
@@ -144,16 +178,29 @@ func (g *Game) Start() error {
 		g.Dealer = append(g.Dealer, card)
 	}
 	for i := range g.Players {
-		if HandValue(g.Players[i].Hand) == 21 {
-			g.Players[i].Status = PlayerBlackjack
+		if HandValue(g.Players[i].Hands[0].Cards) == 21 {
+			g.Players[i].Hands[0].Status = PlayerBlackjack
 		}
 	}
 	if DealerValue(g.Dealer) == 21 || g.actionableCount() == 0 {
 		g.finish()
 		return nil
 	}
-	g.CurrentTurn = g.nextActionableAfter(-1)
+	g.CurrentTurn, g.CurrentHand = g.nextActionableAfter(-1, -1)
 	return nil
+}
+
+// ExtraBetCost 返回该玩家执行 kind 需要额外投入的下注额（要牌/停牌为 0）。
+// 调用方在执行前需确认玩家余额足够并扣款。
+func (g *Game) ExtraBetCost(userID int64, kind ActionKind) int64 {
+	if kind != ActionDouble && kind != ActionSplit {
+		return 0
+	}
+	idx := g.findPlayer(userID)
+	if idx < 0 || idx != g.CurrentTurn || g.CurrentHand < 0 || g.CurrentHand >= len(g.Players[idx].Hands) {
+		return 0
+	}
+	return g.Players[idx].Hands[g.CurrentHand].Bet
 }
 
 func (g *Game) ApplyAction(userID int64, kind ActionKind) (ActionResult, error) {
@@ -168,9 +215,14 @@ func (g *Game) ApplyAction(userID int64, kind ActionKind) (ActionResult, error) 
 		return ActionResult{}, fmt.Errorf("还没轮到你行动，当前行动玩家是 %s", g.Players[g.CurrentTurn].Display)
 	}
 	p := &g.Players[idx]
-	if p.Status != PlayerActive {
+	if g.CurrentHand < 0 || g.CurrentHand >= len(p.Hands) {
 		return ActionResult{}, errors.New("你当前不能行动")
 	}
+	hand := &p.Hands[g.CurrentHand]
+	if hand.Status != PlayerActive {
+		return ActionResult{}, errors.New("你当前不能行动")
+	}
+	label := handLabel(p, g.CurrentHand)
 	var messages []string
 	switch kind {
 	case ActionHit:
@@ -178,20 +230,62 @@ func (g *Game) ApplyAction(userID int64, kind ActionKind) (ActionResult, error) 
 		if err != nil {
 			return ActionResult{}, err
 		}
-		p.Hand = append(p.Hand, card)
-		value := HandValue(p.Hand)
+		hand.Cards = append(hand.Cards, card)
+		value := HandValue(hand.Cards)
 		if value > 21 {
-			p.Status = PlayerBust
-			messages = append(messages, fmt.Sprintf("%s 要牌 %s，点数 %d，爆牌", p.Display, card.String(), value))
+			hand.Status = PlayerBust
+			messages = append(messages, fmt.Sprintf("%s 要牌 %s，点数 %d，爆牌", label, card.String(), value))
 		} else if value == 21 {
-			p.Status = PlayerStand
-			messages = append(messages, fmt.Sprintf("%s 要牌 %s，点数 21，自动停牌", p.Display, card.String()))
+			hand.Status = PlayerStand
+			messages = append(messages, fmt.Sprintf("%s 要牌 %s，点数 21，自动停牌", label, card.String()))
 		} else {
-			messages = append(messages, fmt.Sprintf("%s 要牌 %s，当前点数 %d", p.Display, card.String(), value))
+			messages = append(messages, fmt.Sprintf("%s 要牌 %s，当前点数 %d", label, card.String(), value))
 		}
 	case ActionStand:
-		p.Status = PlayerStand
-		messages = append(messages, fmt.Sprintf("%s 停牌，点数 %d", p.Display, HandValue(p.Hand)))
+		hand.Status = PlayerStand
+		messages = append(messages, fmt.Sprintf("%s 停牌，点数 %d", label, HandValue(hand.Cards)))
+	case ActionDouble:
+		if !canDouble(hand) {
+			return ActionResult{}, errors.New("只能在两张牌时加倍")
+		}
+		card, err := g.draw()
+		if err != nil {
+			return ActionResult{}, err
+		}
+		hand.Bet *= 2
+		hand.Doubled = true
+		hand.Cards = append(hand.Cards, card)
+		value := HandValue(hand.Cards)
+		if value > 21 {
+			hand.Status = PlayerBust
+			messages = append(messages, fmt.Sprintf("%s 加倍至 %d，要牌 %s，点数 %d，爆牌", label, hand.Bet, card.String(), value))
+		} else {
+			hand.Status = PlayerStand
+			messages = append(messages, fmt.Sprintf("%s 加倍至 %d，要牌 %s，点数 %d，停牌", label, hand.Bet, card.String(), value))
+		}
+	case ActionSplit:
+		if !canSplit(p, hand) {
+			return ActionResult{}, errors.New("只有两张同点数的牌且未分过牌时才能分牌")
+		}
+		isAces := cardPoint(hand.Cards[0]) == 11
+		second := Hand{Cards: []poker.Card{hand.Cards[1]}, Bet: hand.Bet, Status: PlayerActive}
+		hand.Cards = hand.Cards[:1]
+		p.Hands = append(p.Hands, second)
+		for i := range p.Hands {
+			card, err := g.draw()
+			if err != nil {
+				return ActionResult{}, err
+			}
+			p.Hands[i].Cards = append(p.Hands[i].Cards, card)
+			// 分出的 A 每手只补一张牌后自动停牌（常见规则）。
+			if isAces || HandValue(p.Hands[i].Cards) == 21 {
+				p.Hands[i].Status = PlayerStand
+			}
+		}
+		messages = append(messages, fmt.Sprintf("%s 分牌：手牌1 %s（%d点），手牌2 %s（%d点）",
+			p.Display,
+			poker.CardsString(p.Hands[0].Cards), HandValue(p.Hands[0].Cards),
+			poker.CardsString(p.Hands[1].Cards), HandValue(p.Hands[1].Cards)))
 	default:
 		return ActionResult{}, errors.New("未知行动")
 	}
@@ -199,7 +293,11 @@ func (g *Game) ApplyAction(userID int64, kind ActionKind) (ActionResult, error) 
 		g.finish()
 		return ActionResult{Messages: append(messages, "庄家补牌并结算"), Finished: true}, nil
 	}
-	g.CurrentTurn = g.nextActionableAfter(idx)
+	// 分牌后留在原玩家身上继续行动；其它行动转给下一手。
+	if kind == ActionSplit && p.Hands[g.CurrentHand].Status == PlayerActive {
+		return ActionResult{Messages: messages}, nil
+	}
+	g.CurrentTurn, g.CurrentHand = g.nextActionableAfter(idx, g.CurrentHand)
 	return ActionResult{Messages: messages}, nil
 }
 
@@ -218,9 +316,29 @@ func (g *Game) CurrentPlayer() *Player {
 	return &g.Players[g.CurrentTurn]
 }
 
+// CurrentActiveHand 返回当前行动的手牌，没有则返回 nil。
+func (g *Game) CurrentActiveHand() *Hand {
+	p := g.CurrentPlayer()
+	if p == nil || g.CurrentHand < 0 || g.CurrentHand >= len(p.Hands) {
+		return nil
+	}
+	return &p.Hands[g.CurrentHand]
+}
+
+func (g *Game) CanDoubleCurrent() bool {
+	hand := g.CurrentActiveHand()
+	return hand != nil && canDouble(hand)
+}
+
+func (g *Game) CanSplitCurrent() bool {
+	p := g.CurrentPlayer()
+	hand := g.CurrentActiveHand()
+	return p != nil && hand != nil && canSplit(p, hand)
+}
+
 func (g *Game) finish() {
 	dealerNatural := len(g.Dealer) == 2 && DealerValue(g.Dealer) == 21
-	for DealerValue(g.Dealer) < 17 && hasStandingPlayer(g.Players) {
+	for DealerValue(g.Dealer) < 17 && hasStandingHand(g.Players) {
 		card, err := g.draw()
 		if err != nil {
 			break
@@ -231,57 +349,60 @@ func (g *Game) finish() {
 	dealerBust := dealerValue > 21
 	awards := make([]Award, 0, len(g.Players))
 	for _, p := range g.Players {
-		value := HandValue(p.Hand)
-		award := Award{UserID: p.UserID, Bet: p.Bet}
-		switch {
-		case p.Status == PlayerBust || value > 21:
-			award.Payout = 0
-			award.Net = -p.Bet
-			award.Reason = "玩家爆牌"
-		case p.Status == PlayerBlackjack && dealerNatural:
-			award.Payout = p.Bet
-			award.Net = 0
-			award.Reason = "双方 Blackjack 平局退回"
-		case p.Status == PlayerBlackjack:
-			award.Payout = p.Bet + p.Bet*3/2
-			award.Net = award.Payout - p.Bet
-			award.Reason = "Blackjack"
-		case dealerBust:
-			award.Payout = p.Bet * 2
-			award.Net = p.Bet
-			award.Reason = "庄家爆牌"
-		case value > dealerValue:
-			award.Payout = p.Bet * 2
-			award.Net = p.Bet
-			award.Reason = "点数大于庄家"
-		case value == dealerValue:
-			award.Payout = p.Bet
-			award.Net = 0
-			award.Reason = "平局退回"
-		default:
-			award.Payout = 0
-			award.Net = -p.Bet
-			award.Reason = "点数小于庄家"
+		for _, hand := range p.Hands {
+			value := HandValue(hand.Cards)
+			award := Award{UserID: p.UserID, Bet: hand.Bet}
+			switch {
+			case hand.Status == PlayerBust || value > 21:
+				award.Payout = 0
+				award.Net = -hand.Bet
+				award.Reason = "玩家爆牌"
+			case hand.Status == PlayerBlackjack && dealerNatural:
+				award.Payout = hand.Bet
+				award.Net = 0
+				award.Reason = "双方 Blackjack 平局退回"
+			case hand.Status == PlayerBlackjack:
+				award.Payout = hand.Bet + hand.Bet*3/2
+				award.Net = award.Payout - hand.Bet
+				award.Reason = "Blackjack"
+			case dealerNatural:
+				award.Payout = 0
+				award.Net = -hand.Bet
+				award.Reason = "庄家 Blackjack"
+			case dealerBust:
+				award.Payout = hand.Bet * 2
+				award.Net = hand.Bet
+				award.Reason = "庄家爆牌"
+			case value > dealerValue:
+				award.Payout = hand.Bet * 2
+				award.Net = hand.Bet
+				award.Reason = "点数大于庄家"
+			case value == dealerValue:
+				award.Payout = hand.Bet
+				award.Net = 0
+				award.Reason = "平局退回"
+			default:
+				award.Payout = 0
+				award.Net = -hand.Bet
+				award.Reason = "点数小于庄家"
+			}
+			awards = append(awards, award)
 		}
-		awards = append(awards, award)
 	}
 	g.Awards = awards
 	g.Status = StatusFinished
 	g.CurrentTurn = -1
+	g.CurrentHand = -1
 }
 
 func HandValue(cards []poker.Card) int {
 	total := 0
 	aces := 0
 	for _, card := range cards {
-		switch {
-		case card.Rank == 14:
-			total += 11
+		point := cardPoint(card)
+		total += point
+		if point == 11 {
 			aces++
-		case card.Rank >= 10:
-			total += 10
-		default:
-			total += card.Rank
 		}
 	}
 	for total > 21 && aces > 0 {
@@ -289,6 +410,17 @@ func HandValue(cards []poker.Card) int {
 		aces--
 	}
 	return total
+}
+
+func cardPoint(card poker.Card) int {
+	switch {
+	case card.Rank == 14:
+		return 11
+	case card.Rank >= 10:
+		return 10
+	default:
+		return card.Rank
+	}
 }
 
 func DealerValue(cards []poker.Card) int {
@@ -311,24 +443,40 @@ func (g *Game) findPlayer(userID int64) int {
 	return -1
 }
 
-func (g *Game) nextActionableAfter(idx int) int {
+// nextActionableAfter 从 (playerIdx, handIdx) 之后找下一个待行动的手牌，
+// 先看同一玩家的后续手牌，再轮转到其他玩家。
+func (g *Game) nextActionableAfter(playerIdx, handIdx int) (int, int) {
 	if len(g.Players) == 0 {
-		return -1
+		return -1, -1
 	}
-	for offset := 1; offset <= len(g.Players); offset++ {
-		next := (idx + offset) % len(g.Players)
-		if g.Players[next].Status == PlayerActive {
-			return next
+	if playerIdx >= 0 && playerIdx < len(g.Players) {
+		for h := handIdx + 1; h < len(g.Players[playerIdx].Hands); h++ {
+			if g.Players[playerIdx].Hands[h].Status == PlayerActive {
+				return playerIdx, h
+			}
 		}
 	}
-	return -1
+	for offset := 1; offset <= len(g.Players); offset++ {
+		next := (playerIdx + offset) % len(g.Players)
+		if next < 0 {
+			next += len(g.Players)
+		}
+		for h, hand := range g.Players[next].Hands {
+			if hand.Status == PlayerActive {
+				return next, h
+			}
+		}
+	}
+	return -1, -1
 }
 
 func (g *Game) actionableCount() int {
 	count := 0
 	for _, p := range g.Players {
-		if p.Status == PlayerActive {
-			count++
+		for _, hand := range p.Hands {
+			if hand.Status == PlayerActive {
+				count++
+			}
 		}
 	}
 	return count
@@ -343,10 +491,28 @@ func (g *Game) draw() (poker.Card, error) {
 	return card, nil
 }
 
-func hasStandingPlayer(players []Player) bool {
+func canDouble(hand *Hand) bool {
+	return hand.Status == PlayerActive && len(hand.Cards) == 2 && !hand.Doubled
+}
+
+func canSplit(p *Player, hand *Hand) bool {
+	return hand.Status == PlayerActive && len(p.Hands) == 1 && len(hand.Cards) == 2 &&
+		cardPoint(hand.Cards[0]) == cardPoint(hand.Cards[1])
+}
+
+func handLabel(p *Player, handIdx int) string {
+	if len(p.Hands) <= 1 {
+		return p.Display
+	}
+	return fmt.Sprintf("%s 手牌%d", p.Display, handIdx+1)
+}
+
+func hasStandingHand(players []Player) bool {
 	for _, p := range players {
-		if p.Status == PlayerStand {
-			return true
+		for _, hand := range p.Hands {
+			if hand.Status == PlayerStand {
+				return true
+			}
 		}
 	}
 	return false

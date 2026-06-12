@@ -187,7 +187,7 @@ func (s *Store) BeginBlackjack(ctx context.Context, game *blackjack.Game, deadli
 	}
 	defer tx.Rollback()
 	for _, p := range game.Players {
-		if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, p.UserID, game.ID, "blackjack_bet", -p.Bet, "21点下注"); err != nil {
+		if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, p.UserID, game.ID, "blackjack_bet", -p.TotalBet(), "21点下注"); err != nil {
 			return err
 		}
 	}
@@ -203,12 +203,17 @@ func (s *Store) BeginBlackjack(ctx context.Context, game *blackjack.Game, deadli
 	return tx.Commit()
 }
 
-func (s *Store) SaveRunningBlackjack(ctx context.Context, game *blackjack.Game, deadline time.Time, actorID int64, kind string, payload string) error {
+func (s *Store) SaveRunningBlackjack(ctx context.Context, game *blackjack.Game, deadline time.Time, actorID int64, kind string, payload string, extraBet int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if extraBet > 0 {
+		if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, actorID, game.ID, "blackjack_bet", -extraBet, "21点"+kind+"追加下注"); err != nil {
+			return err
+		}
+	}
 	if err := s.insertOrUpdateBlackjackTx(ctx, tx, game, 0, deadline); err != nil {
 		return err
 	}
@@ -223,12 +228,17 @@ func (s *Store) SaveRunningBlackjack(ctx context.Context, game *blackjack.Game, 
 	return tx.Commit()
 }
 
-func (s *Store) FinishBlackjack(ctx context.Context, game *blackjack.Game) error {
+func (s *Store) FinishBlackjack(ctx context.Context, game *blackjack.Game, actorID int64, extraBet int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if extraBet > 0 {
+		if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, actorID, game.ID, "blackjack_bet", -extraBet, "21点追加下注"); err != nil {
+			return err
+		}
+	}
 	for _, award := range game.Awards {
 		if award.Payout > 0 {
 			if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, award.UserID, game.ID, "blackjack_payout", award.Payout, award.Reason); err != nil {
@@ -445,7 +455,7 @@ func (s *Store) replaceBlackjackPlayersTx(ctx context.Context, tx *sql.Tx, game 
 	for _, p := range game.Players {
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO game_players(game_id, chat_id, user_id, seat, display_name, stack, status)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, game.ID, game.ChatID, p.UserID, p.Seat, p.Display, p.Bet, p.Status); err != nil {
+VALUES (?, ?, ?, ?, ?, ?, ?)`, game.ID, game.ChatID, p.UserID, p.Seat, p.Display, p.TotalBet(), p.SummaryStatus()); err != nil {
 			return err
 		}
 	}

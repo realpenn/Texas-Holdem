@@ -121,17 +121,33 @@ func blackjackWaitingText(game *blackjack.Game, deadline time.Time) string {
 		game.Bet, len(game.Players), strings.Join(names, "、"), deadline.Format("15:04:05"))
 }
 
+func blackjackHandLine(p blackjack.Player, handIdx int) string {
+	hand := p.Hands[handIdx]
+	name := p.Display
+	if len(p.Hands) > 1 {
+		name = fmt.Sprintf("%s 手牌%d", p.Display, handIdx+1)
+	}
+	extra := ""
+	if hand.Doubled {
+		extra = "，已加倍"
+	}
+	return fmt.Sprintf("%s：%s（%d点，%s%s）", name, poker.CardsString(hand.Cards), blackjack.HandValue(hand.Cards), blackjackPlayerStatus(hand.Status), extra)
+}
+
 func blackjackGameText(game *blackjack.Game, deadline time.Time) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "庄家明牌：%s\n", boardText(game.DealerVisibleCards()))
+	current := game.CurrentPlayer()
 	for _, p := range game.Players {
-		marker := " "
-		if current := game.CurrentPlayer(); current != nil && current.UserID == p.UserID {
-			marker = ">"
+		for h := range p.Hands {
+			marker := " "
+			if current != nil && current.UserID == p.UserID && h == game.CurrentHand {
+				marker = ">"
+			}
+			fmt.Fprintf(&b, "%s %s\n", marker, blackjackHandLine(p, h))
 		}
-		fmt.Fprintf(&b, "%s %s：%s（%d点，%s）\n", marker, p.Display, poker.CardsString(p.Hand), blackjack.HandValue(p.Hand), blackjackPlayerStatus(p.Status))
 	}
-	if current := game.CurrentPlayer(); current != nil {
+	if current != nil {
 		fmt.Fprintf(&b, "轮到：%s，截止 %s", current.Display, deadline.Format("15:04:05"))
 	}
 	return b.String()
@@ -141,7 +157,9 @@ func blackjackSettlementText(game *blackjack.Game) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "21点结束\n庄家：%s（%d点）\n玩家手牌：\n", poker.CardsString(game.Dealer), blackjack.HandValue(game.Dealer))
 	for _, p := range game.Players {
-		fmt.Fprintf(&b, "%s：%s（%d点，%s）\n", p.Display, poker.CardsString(p.Hand), blackjack.HandValue(p.Hand), blackjackPlayerStatus(p.Status))
+		for h := range p.Hands {
+			fmt.Fprintf(&b, "%s\n", blackjackHandLine(p, h))
+		}
 	}
 	for _, award := range game.Awards {
 		name := blackjackPlayerName(game, award.UserID)
@@ -157,10 +175,17 @@ func blackjackActionKeyboard(game *blackjack.Game) tgbotapi.InlineKeyboardMarkup
 		},
 	}
 	if game.CurrentPlayer() != nil {
-		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		row := []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData("要牌", "bjact:"+game.ID+":hit"),
 			tgbotapi.NewInlineKeyboardButtonData("停牌", "bjact:"+game.ID+":stand"),
-		))
+		}
+		if game.CanDoubleCurrent() {
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData("加倍", "bjact:"+game.ID+":double"))
+		}
+		if game.CanSplitCurrent() {
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData("分牌", "bjact:"+game.ID+":split"))
+		}
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(row...))
 	}
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
@@ -236,13 +261,35 @@ func blackjackPlayerName(game *blackjack.Game, userID int64) string {
 	return strconv.FormatInt(userID, 10)
 }
 
-func blackjackPlayerHand(game *blackjack.Game, userID int64) ([]poker.Card, bool) {
+func blackjackPlayerHandText(game *blackjack.Game, userID int64) (string, bool) {
 	for _, p := range game.Players {
 		if p.UserID == userID {
-			return append([]poker.Card(nil), p.Hand...), len(p.Hand) > 0
+			if len(p.Hands) == 0 || len(p.Hands[0].Cards) == 0 {
+				return "", false
+			}
+			parts := make([]string, 0, len(p.Hands))
+			for _, hand := range p.Hands {
+				parts = append(parts, fmt.Sprintf("%s（%d点）", poker.CardsString(hand.Cards), blackjack.HandValue(hand.Cards)))
+			}
+			return strings.Join(parts, "；"), true
 		}
 	}
-	return nil, false
+	return "", false
+}
+
+func blackjackActionLabel(kind blackjack.ActionKind) string {
+	switch kind {
+	case blackjack.ActionHit:
+		return "要牌"
+	case blackjack.ActionStand:
+		return "停牌"
+	case blackjack.ActionDouble:
+		return "加倍"
+	case blackjack.ActionSplit:
+		return "分牌"
+	default:
+		return string(kind)
+	}
 }
 
 func blackjackPlayerStatus(status string) string {

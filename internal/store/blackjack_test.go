@@ -38,7 +38,7 @@ func TestBlackjackGamePersistsAndSettles(t *testing.T) {
 	if err := st.BeginBlackjack(ctx, game, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.FinishBlackjack(ctx, game); err != nil {
+	if err := st.FinishBlackjack(ctx, game, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	balance, err := st.Balance(ctx, -100, 1)
