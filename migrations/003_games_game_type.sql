@@ -1,0 +1,1 @@
+ALTER TABLE games ADD COLUMN game_type TEXT NOT NULL DEFAULT 'holdem';
