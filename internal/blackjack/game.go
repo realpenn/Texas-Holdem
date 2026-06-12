@@ -219,7 +219,8 @@ func (g *Game) CurrentPlayer() *Player {
 }
 
 func (g *Game) finish() {
-	for DealerValue(g.Dealer) < 17 && hasNonBustPlayer(g.Players) {
+	dealerNatural := len(g.Dealer) == 2 && DealerValue(g.Dealer) == 21
+	for DealerValue(g.Dealer) < 17 && hasStandingPlayer(g.Players) {
 		card, err := g.draw()
 		if err != nil {
 			break
@@ -237,7 +238,11 @@ func (g *Game) finish() {
 			award.Payout = 0
 			award.Net = -p.Bet
 			award.Reason = "玩家爆牌"
-		case p.Status == PlayerBlackjack && DealerValue(g.Dealer) != 21:
+		case p.Status == PlayerBlackjack && dealerNatural:
+			award.Payout = p.Bet
+			award.Net = 0
+			award.Reason = "双方 Blackjack 平局退回"
+		case p.Status == PlayerBlackjack:
 			award.Payout = p.Bet + p.Bet*3/2
 			award.Net = award.Payout - p.Bet
 			award.Reason = "Blackjack"
@@ -338,9 +343,9 @@ func (g *Game) draw() (poker.Card, error) {
 	return card, nil
 }
 
-func hasNonBustPlayer(players []Player) bool {
+func hasStandingPlayer(players []Player) bool {
 	for _, p := range players {
-		if p.Status != PlayerBust {
+		if p.Status == PlayerStand {
 			return true
 		}
 	}

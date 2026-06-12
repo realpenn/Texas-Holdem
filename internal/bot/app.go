@@ -346,8 +346,12 @@ func (a *App) joinBlackjack(ctx context.Context, m *tgbotapi.Message, active sto
 		return
 	}
 	bal, err := a.store.Balance(ctx, m.Chat.ID, m.From.ID)
-	if err != nil || bal < game.Bet {
-		a.reply(m.Chat.ID, m.MessageID, fmt.Sprintf("余额不足，21点下注需要 %d。", game.Bet))
+	if err != nil {
+		a.reply(m.Chat.ID, m.MessageID, "读取余额失败："+err.Error())
+		return
+	}
+	if bal < game.Bet {
+		a.reply(m.Chat.ID, m.MessageID, fmt.Sprintf("余额不足，21点下注需要 %d，当前 %d。", game.Bet, bal))
 		return
 	}
 	if err := game.AddPlayer(m.From.ID, displayName(m.From)); err != nil {
