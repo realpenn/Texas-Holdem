@@ -148,7 +148,7 @@ FROM recharge_codes WHERE code = ?`, code).Scan(&amount, &maxUses, &usedCount, &
 		return 0, 0, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO redemptions(code, chat_id, user_id, amount) VALUES (?, ?, ?, ?)`, code, chatID, userID, amount); err != nil {
-		return 0, 0, errors.New("你已经兑换过这个充值码")
+		return 0, 0, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE recharge_codes SET used_count = used_count + 1 WHERE code = ?`, code); err != nil {
 		return 0, 0, err

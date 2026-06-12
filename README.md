@@ -23,6 +23,8 @@ go run ./cmd/bot
 
 牌局行动通过群内按钮完成。
 
+充值码只按总次数限制；只要次数没用完，同一用户可以重复兑换同一个充值码。
+
 管理员私聊命令：
 
 - `/code CODE AMOUNT MAX_USES [YYYY-MM-DD]` 创建充值码
