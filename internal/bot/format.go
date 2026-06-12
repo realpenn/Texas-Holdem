@@ -22,13 +22,17 @@ func waitingText(game *poker.Game, deadline time.Time) string {
 
 func gameText(game *poker.Game, deadline time.Time) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "阶段：%s\n底池：%d\n公共牌：%s\n", streetLabel(game.Street), game.Pot, boardText(game.Board))
-	for _, p := range game.Players {
+	fmt.Fprintf(&b, "第 %d 手 · 阶段：%s\n底池：%d\n公共牌：%s\n", game.HandNo, streetLabel(game.Street), game.Pot, boardText(game.Board))
+	for i, p := range game.Players {
 		marker := " "
 		if current := game.CurrentPlayer(); current != nil && current.UserID == p.UserID {
 			marker = ">"
 		}
-		fmt.Fprintf(&b, "%s %s：%d（%s，本轮 %d）\n", marker, p.Display, p.Stack, playerStatus(p.Status), p.CurrentBet)
+		button := ""
+		if i == game.Dealer {
+			button = "（庄）"
+		}
+		fmt.Fprintf(&b, "%s %s%s：%d（%s，本轮 %d）\n", marker, p.Display, button, p.Stack, playerStatus(p.Status), p.CurrentBet)
 	}
 	if current := game.CurrentPlayer(); current != nil {
 		toCall := game.ToCall()
@@ -62,6 +66,10 @@ func settlementText(game *poker.Game) string {
 			fmt.Fprintf(&b, "%s 赢得 %d，服务费 %d，入账 %d（%s）\n", name, award.Gross, award.Fee, award.Net, award.Reason)
 		}
 	}
+	b.WriteString("当前筹码：")
+	for _, p := range game.Players {
+		fmt.Fprintf(&b, "%s %d；", p.Display, p.Stack)
+	}
 	return strings.TrimSpace(b.String())
 }
 
@@ -88,17 +96,49 @@ func actionKeyboard(game *poker.Game) tgbotapi.InlineKeyboardMarkup {
 		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("弃牌", "act:"+game.ID+":fold"),
 			tgbotapi.NewInlineKeyboardButtonData("跟注", "act:"+game.ID+":call"),
-			tgbotapi.NewInlineKeyboardButtonData("最小加注", "act:"+game.ID+":raise"),
 			tgbotapi.NewInlineKeyboardButtonData("All-in", "act:"+game.ID+":allin"),
 		))
 	} else {
 		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("过牌", "act:"+game.ID+":check"),
-			tgbotapi.NewInlineKeyboardButtonData("最小加注", "act:"+game.ID+":raise"),
 			tgbotapi.NewInlineKeyboardButtonData("All-in", "act:"+game.ID+":allin"),
 		))
 	}
+	if row := raiseRow(game, current); len(row) > 0 {
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(row...))
+	}
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
+}
+
+// raiseRow 给当前玩家生成加注档位按钮：最小加注、半池、满池。
+// 金额是“加注到”的总额，写进回调数据；不低于 all-in 总额的档位省略。
+func raiseRow(game *poker.Game, current *poker.Player) []tgbotapi.InlineKeyboardButton {
+	toCall := game.ToCall()
+	maxTo := current.CurrentBet + current.Stack
+	minTo := game.MinRaiseTo()
+	if minTo >= maxTo {
+		return nil
+	}
+	row := []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("最小加注 %d", minTo), fmt.Sprintf("act:%s:raise:%d", game.ID, minTo)),
+	}
+	potAfterCall := game.Pot + toCall
+	for _, opt := range []struct {
+		label string
+		extra int64
+	}{
+		{"半池", potAfterCall / 2},
+		{"满池", potAfterCall},
+	} {
+		target := game.CurrentBet + opt.extra
+		if target <= minTo || target >= maxTo {
+			continue
+		}
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(
+			fmt.Sprintf("%s %d", opt.label, target),
+			fmt.Sprintf("act:%s:raise:%d", game.ID, target)))
+	}
+	return row
 }
 
 func displayName(user *tgbotapi.User) string {
@@ -169,15 +209,4 @@ func parsePositiveOr(raw string, fallback int64) int64 {
 		return fallback
 	}
 	return v
-}
-
-func parseIntArg(args []string, idx int) (int64, error) {
-	if len(args) <= idx {
-		return 0, fmt.Errorf("missing argument")
-	}
-	v, err := strconv.ParseInt(args[idx], 10, 64)
-	if err != nil || v <= 0 {
-		return 0, fmt.Errorf("invalid integer")
-	}
-	return v, nil
 }

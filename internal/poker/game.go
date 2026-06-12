@@ -1,10 +1,15 @@
 package poker
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"sort"
 )
+
+// ErrNotEnoughPlayers 表示牌桌剩余有筹码的玩家不足，无法继续下一手。
+var ErrNotEnoughPlayers = errors.New("牌桌人数不足")
 
 const (
 	StatusWaiting  = "waiting"
@@ -54,6 +59,7 @@ type Game struct {
 	Settings
 	Status      string   `json:"status"`
 	Street      string   `json:"street"`
+	HandNo      int      `json:"hand_no"`
 	Players     []Player `json:"players"`
 	Deck        []Card   `json:"deck"`
 	Board       []Card   `json:"board"`
@@ -100,8 +106,8 @@ func NewGame(settings Settings) *Game {
 }
 
 func (g *Game) AddPlayer(userID int64, display string) error {
-	if g.Status != StatusWaiting {
-		return errors.New("牌局已经开始")
+	if g.Status != StatusWaiting && !g.BetweenHands() {
+		return errors.New("本手进行中，结束后才能加入")
 	}
 	if len(g.Players) >= 9 {
 		return errors.New("本局最多 9 人")
@@ -119,19 +125,39 @@ func (g *Game) AddPlayer(userID int64, display string) error {
 	return nil
 }
 
-func (g *Game) RemovePlayer(userID int64) error {
-	if g.Status != StatusWaiting {
-		return errors.New("牌局已经开始")
+func (g *Game) RemovePlayer(userID int64) (Player, error) {
+	if g.Status != StatusWaiting && !g.BetweenHands() {
+		return Player{}, errors.New("本手进行中，结束后才能离桌")
 	}
 	idx := g.findPlayer(userID)
 	if idx < 0 {
-		return errors.New("你不在本局中")
+		return Player{}, errors.New("你不在本局中")
 	}
+	dealerUserID := int64(0)
+	if g.Dealer >= 0 && g.Dealer < len(g.Players) {
+		dealerUserID = g.Players[g.Dealer].UserID
+	}
+	removed := g.Players[idx]
 	g.Players = append(g.Players[:idx], g.Players[idx+1:]...)
 	for i := range g.Players {
 		g.Players[i].Seat = i
 	}
-	return nil
+	g.reanchorDealerAfterRemove(idx, removed.UserID, dealerUserID)
+	return removed, nil
+}
+
+func (g *Game) reanchorDealerAfterRemove(removedIdx int, removedUserID, dealerUserID int64) {
+	if len(g.Players) == 0 {
+		g.Dealer = 0
+		return
+	}
+	if removedUserID == dealerUserID {
+		g.Dealer = (removedIdx - 1 + len(g.Players)) % len(g.Players)
+		return
+	}
+	if idx := g.findPlayer(dealerUserID); idx >= 0 {
+		g.Dealer = idx
+	}
 }
 
 func (g *Game) Start() error {
@@ -141,14 +167,91 @@ func (g *Game) Start() error {
 	if len(g.Players) < 2 {
 		return errors.New("至少需要 2 人开局")
 	}
+	dealer, err := randomInt(len(g.Players))
+	if err != nil {
+		return err
+	}
+	g.Status = StatusRunning
+	g.Dealer = dealer
+	return g.startHand()
+}
+
+// BetweenHands 表示牌桌进行中但上一手已结束、下一手尚未开始。
+func (g *Game) BetweenHands() bool {
+	return g.Status == StatusRunning && g.Street == StreetDone
+}
+
+// PlayersWithChips 返回还有筹码的玩家数。
+func (g *Game) PlayersWithChips() int {
+	count := 0
+	for _, p := range g.Players {
+		if p.Stack > 0 {
+			count++
+		}
+	}
+	return count
+}
+
+// Close 结束整张牌桌；之后由调用方把每个玩家的剩余筹码退回余额。
+func (g *Game) Close() {
+	g.Status = StatusFinished
+	g.Street = StreetDone
+	g.CurrentTurn = -1
+}
+
+// StartNextHand 在两手之间开始下一手：先移除输光的玩家（返回给调用方
+// 通报），庄位移交给下一个仍有筹码的玩家。剩余玩家不足 2 人时返回
+// ErrNotEnoughPlayers，由调用方关桌结算。
+func (g *Game) StartNextHand() ([]Player, error) {
+	if !g.BetweenHands() {
+		return nil, errors.New("当前不能开始下一手")
+	}
+	nextDealerUser := int64(0)
+	for offset := 1; offset <= len(g.Players); offset++ {
+		p := g.Players[(g.Dealer+offset)%len(g.Players)]
+		if p.Stack > 0 {
+			nextDealerUser = p.UserID
+			break
+		}
+	}
+	removed := make([]Player, 0)
+	kept := g.Players[:0]
+	for _, p := range g.Players {
+		if p.Stack > 0 {
+			kept = append(kept, p)
+		} else {
+			removed = append(removed, p)
+		}
+	}
+	g.Players = kept
+	for i := range g.Players {
+		g.Players[i].Seat = i
+	}
+	if len(g.Players) < 2 {
+		return removed, ErrNotEnoughPlayers
+	}
+	if idx := g.findPlayer(nextDealerUser); idx >= 0 {
+		g.Dealer = idx
+	} else {
+		g.Dealer = 0
+	}
+	if err := g.startHand(); err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+
+func (g *Game) startHand() error {
 	deck := NewDeck()
 	if err := Shuffle(deck); err != nil {
 		return err
 	}
 	g.Deck = deck
-	g.Status = StatusRunning
 	g.Street = StreetPreflop
-	g.Dealer = 0
+	g.HandNo++
+	g.Board = nil
+	g.Awards = nil
+	g.Pot = 0
 	g.CurrentBet = 0
 	g.MinRaise = g.BigBlind
 	for i := range g.Players {
@@ -182,8 +285,8 @@ func (g *Game) Start() error {
 }
 
 func (g *Game) ApplyAction(userID int64, kind ActionKind, amount int64) (ActionResult, error) {
-	if g.Status != StatusRunning {
-		return ActionResult{}, errors.New("当前没有进行中的牌局")
+	if g.Status != StatusRunning || g.BetweenHands() || g.CurrentTurn < 0 {
+		return ActionResult{}, errors.New("当前没有进行中的一手")
 	}
 	idx := g.findPlayer(userID)
 	if idx < 0 {
@@ -237,10 +340,11 @@ func (g *Game) ApplyAction(userID int64, kind ActionKind, amount int64) (ActionR
 		}
 		paid := g.pay(idx, needed)
 		g.CurrentBet = p.CurrentBet
+		// 不足最小加注的 all-in 不重开下注圈：已行动玩家只能跟注或弃牌。
 		if raiseBy >= g.MinRaise {
 			g.MinRaise = raiseBy
+			g.resetActedExcept(idx)
 		}
-		g.resetActedExcept(idx)
 		p.HasActed = true
 		if p.Stack == 0 {
 			p.Status = PlayerAllIn
@@ -405,12 +509,32 @@ func (g *Game) finishUncontested() []Award {
 	if winner < 0 {
 		return nil
 	}
-	award := g.makeAward(g.Players[winner].UserID, g.Pot, "其他玩家均已弃牌", "")
+	// 未被任何人跟到的部分原额退回，不参与抽水。
+	maxOther := int64(0)
+	for i, p := range g.Players {
+		if i != winner {
+			maxOther = max(maxOther, p.TotalBet)
+		}
+	}
+	uncalled := max(0, g.Players[winner].TotalBet-maxOther)
+	fee := rake(g.Pot-uncalled, g.RakePercent, g.RakeCap)
+	award := Award{
+		UserID: g.Players[winner].UserID,
+		Gross:  g.Pot,
+		Fee:    fee,
+		Net:    g.Pot - fee,
+		Reason: "其他玩家均已弃牌",
+	}
 	g.Players[winner].Stack += award.Net
-	g.Status = StatusFinished
-	g.Street = StreetDone
-	g.Awards = []Award{award}
+	g.endHand([]Award{award})
 	return g.Awards
+}
+
+// endHand 结束当前一手，但保持牌桌继续（是否关桌由上层根据剩余人数决定）。
+func (g *Game) endHand(awards []Award) {
+	g.Street = StreetDone
+	g.CurrentTurn = -1
+	g.Awards = awards
 }
 
 func (g *Game) finishShowdown() ([]Award, error) {
@@ -438,6 +562,10 @@ func (g *Game) finishShowdown() ([]Award, error) {
 		if len(winners) == 0 {
 			continue
 		}
+		// 平分的零头从庄家下家开始按位置顺序分配。
+		sort.Slice(winners, func(i, j int) bool {
+			return g.relativeToDealer(winners[i]) < g.relativeToDealer(winners[j])
+		})
 		share := pot.Amount / int64(len(winners))
 		remainder := pot.Amount % int64(len(winners))
 		for i, idx := range winners {
@@ -459,10 +587,16 @@ func (g *Game) finishShowdown() ([]Award, error) {
 			awards = append(awards, award)
 		}
 	}
-	g.Status = StatusFinished
-	g.Street = StreetDone
-	g.Awards = awards
+	g.endHand(awards)
 	return awards, nil
+}
+
+func (g *Game) relativeToDealer(idx int) int {
+	n := len(g.Players)
+	if n == 0 {
+		return 0
+	}
+	return ((idx-g.Dealer-1)%n + n) % n
 }
 
 func (g *Game) potWinners(eligible []int) ([]int, string, error) {
@@ -534,11 +668,6 @@ func buildSidePots(players []Player) []sidePot {
 		prev = level
 	}
 	return pots
-}
-
-func (g *Game) makeAward(userID, gross int64, reason, category string) Award {
-	fee := rake(gross, g.RakePercent, g.RakeCap)
-	return Award{UserID: userID, Gross: gross, Fee: fee, Net: gross - fee, Reason: reason, HandCategory: category}
 }
 
 func rake(gross, percent, cap int64) int64 {
@@ -653,6 +782,17 @@ func streetName(street string) string {
 	default:
 		return street
 	}
+}
+
+func randomInt(n int) (int, error) {
+	if n <= 1 {
+		return 0, nil
+	}
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0, err
+	}
+	return int(v.Int64()), nil
 }
 
 func min(a, b int64) int64 {
