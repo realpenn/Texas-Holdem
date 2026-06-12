@@ -18,6 +18,9 @@ import (
 	"texas-holdem/internal/store"
 )
 
+// nextHandDelay 是一手结束后自动开始下一手的间隔，留给玩家离桌/加入。
+const nextHandDelay = 15 * time.Second
+
 type App struct {
 	api   *tgbotapi.BotAPI
 	cfg   config.Config
@@ -247,17 +250,29 @@ func (a *App) cmdJoin(ctx context.Context, m *tgbotapi.Message) {
 		return
 	}
 	game := active.Game
-	if game == nil || game.Status != poker.StatusWaiting {
-		a.reply(m.Chat.ID, m.MessageID, "牌局已经开始，不能加入。")
+	if game == nil || (game.Status != poker.StatusWaiting && !game.BetweenHands()) {
+		a.reply(m.Chat.ID, m.MessageID, "本手进行中，结束后才能加入。")
 		return
 	}
 	bal, err := a.store.Balance(ctx, m.Chat.ID, m.From.ID)
-	if err != nil || bal < game.BuyIn {
-		a.reply(m.Chat.ID, m.MessageID, fmt.Sprintf("余额不足，买入需要 %d。", game.BuyIn))
+	if err != nil {
+		a.reply(m.Chat.ID, m.MessageID, "读取余额失败："+err.Error())
+		return
+	}
+	if bal < game.BuyIn {
+		a.reply(m.Chat.ID, m.MessageID, fmt.Sprintf("余额不足，买入需要 %d，当前 %d。", game.BuyIn, bal))
 		return
 	}
 	if err := game.AddPlayer(m.From.ID, displayName(m.From)); err != nil {
 		a.reply(m.Chat.ID, m.MessageID, err.Error())
+		return
+	}
+	if game.BetweenHands() {
+		if err := a.store.JoinRunningGame(ctx, game, m.From.ID, active.ActionDeadline); err != nil {
+			a.reply(m.Chat.ID, m.MessageID, "加入失败："+err.Error())
+			return
+		}
+		a.send(m.Chat.ID, fmt.Sprintf("%s 已买入 %d，将从下一手加入。", displayName(m.From), game.BuyIn), nil)
 		return
 	}
 	if err := a.store.SaveWaitingGame(ctx, game, active.WaitingMessageID, active.ActionDeadline); err != nil {
@@ -269,19 +284,29 @@ func (a *App) cmdJoin(ctx context.Context, m *tgbotapi.Message) {
 
 func (a *App) cmdLeave(ctx context.Context, m *tgbotapi.Message) {
 	active, err := a.store.ActiveGame(ctx, m.Chat.ID)
-	if err != nil || active.Game == nil || active.Game.Status != poker.StatusWaiting {
-		a.reply(m.Chat.ID, m.MessageID, "当前没有等待中的牌局。")
+	if err != nil || active.Game == nil {
+		a.reply(m.Chat.ID, m.MessageID, "当前没有牌局。")
 		return
 	}
-	if err := active.Game.RemovePlayer(m.From.ID); err != nil {
+	game := active.Game
+	removed, err := game.RemovePlayer(m.From.ID)
+	if err != nil {
 		a.reply(m.Chat.ID, m.MessageID, err.Error())
 		return
 	}
-	if err := a.store.SaveWaitingGame(ctx, active.Game, active.WaitingMessageID, active.ActionDeadline); err != nil {
+	if game.BetweenHands() {
+		if err := a.store.LeaveRunningGame(ctx, game, removed.UserID, removed.Stack, active.ActionDeadline); err != nil {
+			a.reply(m.Chat.ID, m.MessageID, "离开失败："+err.Error())
+			return
+		}
+		a.send(m.Chat.ID, fmt.Sprintf("%s 已离桌，退还筹码 %d。", removed.Display, removed.Stack), nil)
+		return
+	}
+	if err := a.store.SaveWaitingGame(ctx, game, active.WaitingMessageID, active.ActionDeadline); err != nil {
 		a.reply(m.Chat.ID, m.MessageID, "离开失败："+err.Error())
 		return
 	}
-	a.send(m.Chat.ID, waitingText(active.Game, active.ActionDeadline.In(a.cfg.Location)), waitingKeyboard(active.Game.ID))
+	a.send(m.Chat.ID, waitingText(game, active.ActionDeadline.In(a.cfg.Location)), waitingKeyboard(game.ID))
 }
 
 func (a *App) cmdBegin(ctx context.Context, m *tgbotapi.Message) {
@@ -299,19 +324,43 @@ func (a *App) cmdBegin(ctx context.Context, m *tgbotapi.Message) {
 
 func (a *App) cmdCancel(ctx context.Context, m *tgbotapi.Message) {
 	active, err := a.store.ActiveGame(ctx, m.Chat.ID)
-	if err != nil || active.Game == nil || active.Game.Status != poker.StatusWaiting {
-		a.reply(m.Chat.ID, m.MessageID, "当前没有可取消的等待局。")
+	if err != nil || active.Game == nil {
+		a.reply(m.Chat.ID, m.MessageID, "当前没有可取消的牌局。")
 		return
 	}
-	if active.Game.CreatorID != m.From.ID && !a.cfg.IsAdmin(m.From.ID) {
+	game := active.Game
+	if game.CreatorID != m.From.ID && !a.cfg.IsAdmin(m.From.ID) {
 		a.reply(m.Chat.ID, m.MessageID, "只有发起人或管理员可以取消。")
 		return
 	}
-	if err := a.store.CancelWaitingGame(ctx, active.Game, m.From.ID); err != nil {
+	if game.BetweenHands() {
+		a.closeTable(ctx, game, "发起人结束了牌桌。")
+		return
+	}
+	if game.Status != poker.StatusWaiting {
+		a.reply(m.Chat.ID, m.MessageID, "本手进行中，结束后才能关闭牌桌。")
+		return
+	}
+	if err := a.store.CancelWaitingGame(ctx, game, m.From.ID); err != nil {
 		a.reply(m.Chat.ID, m.MessageID, "取消失败："+err.Error())
 		return
 	}
 	a.send(m.Chat.ID, "牌局已取消。", nil)
+}
+
+func (a *App) closeTable(ctx context.Context, game *poker.Game, reason string) {
+	game.Close()
+	if err := a.store.CloseGame(ctx, game); err != nil {
+		a.send(game.ChatID, "关桌结算失败："+err.Error(), nil)
+		return
+	}
+	var b strings.Builder
+	b.WriteString(reason)
+	b.WriteString("\n筹码已退回余额：")
+	for _, p := range game.Players {
+		fmt.Fprintf(&b, "\n%s：%d", p.Display, p.Stack)
+	}
+	a.send(game.ChatID, b.String(), nil)
 }
 
 func (a *App) cmdBalance(ctx context.Context, m *tgbotapi.Message) {
@@ -400,6 +449,14 @@ func (a *App) handleCallback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 		amount := int64(0)
 		if kind == poker.ActionRaise {
 			amount = game.MinRaiseTo()
+			if len(parts) >= 4 {
+				v, err := strconv.ParseInt(parts[3], 10, 64)
+				if err != nil || v <= 0 {
+					a.answerCallback(q.ID, "无效加注金额", true)
+					return
+				}
+				amount = v
+			}
 		}
 		a.answerCallback(q.ID, "行动已提交", false)
 		a.applyAction(ctx, game, q.From.ID, kind, amount)
@@ -429,7 +486,7 @@ func (a *App) startWaitingGame(ctx context.Context, active store.ActiveGame, aut
 		a.send(game.ChatID, "开局失败："+err.Error(), nil)
 		return
 	}
-	a.send(game.ChatID, "牌局开始！\n"+gameText(game, deadline.In(a.cfg.Location)), actionKeyboard(game))
+	a.send(game.ChatID, fmt.Sprintf("牌局开始！第 %d 手\n", game.HandNo)+gameText(game, deadline.In(a.cfg.Location)), actionKeyboard(game))
 }
 
 func (a *App) applyAction(ctx context.Context, game *poker.Game, userID int64, kind poker.ActionKind, amount int64) {
@@ -440,15 +497,7 @@ func (a *App) applyAction(ctx context.Context, game *poker.Game, userID int64, k
 	}
 	text := strings.Join(result.Messages, "\n")
 	if result.Finished {
-		if err := a.store.FinishGame(ctx, game); err != nil {
-			a.send(game.ChatID, "结算失败："+err.Error(), nil)
-			return
-		}
-		if text != "" {
-			text += "\n"
-		}
-		text += settlementText(game)
-		a.send(game.ChatID, text, nil)
+		a.finishHand(ctx, game, text)
 		return
 	}
 	deadline := time.Now().Add(time.Duration(game.ActionSeconds) * time.Second)
@@ -461,6 +510,58 @@ func (a *App) applyAction(ctx context.Context, game *poker.Game, userID int64, k
 	}
 	text += gameText(game, deadline.In(a.cfg.Location))
 	a.send(game.ChatID, text, actionKeyboard(game))
+}
+
+// finishHand 在一手结束后结算抽水；牌桌人数仍够则安排下一手，否则关桌退筹码。
+func (a *App) finishHand(ctx context.Context, game *poker.Game, prefix string) {
+	text := prefix
+	if text != "" {
+		text += "\n"
+	}
+	text += settlementText(game)
+	if game.PlayersWithChips() < 2 {
+		if err := a.store.SettleHand(ctx, game, time.Time{}); err != nil {
+			a.send(game.ChatID, "结算失败："+err.Error(), nil)
+			return
+		}
+		a.send(game.ChatID, text, nil)
+		a.closeTable(ctx, game, "牌桌剩余人数不足，自动结束。")
+		return
+	}
+	deadline := time.Now().Add(nextHandDelay)
+	if err := a.store.SettleHand(ctx, game, deadline); err != nil {
+		a.send(game.ChatID, "结算失败："+err.Error(), nil)
+		return
+	}
+	text += fmt.Sprintf("\n\n%d 秒后自动开始下一手；期间可 /leave 离桌结算、/join 买入加入，发起人 /cancel 关桌。", int(nextHandDelay.Seconds()))
+	a.send(game.ChatID, text, nil)
+}
+
+// startNextHand 两手间隔到期后开始下一手；筹码输光的玩家自动离桌。
+func (a *App) startNextHand(ctx context.Context, game *poker.Game) {
+	removed, err := game.StartNextHand()
+	prefix := ""
+	if len(removed) > 0 {
+		names := make([]string, 0, len(removed))
+		for _, p := range removed {
+			names = append(names, p.Display)
+		}
+		prefix = strings.Join(names, "、") + " 筹码输光，自动离桌。\n"
+	}
+	if errors.Is(err, poker.ErrNotEnoughPlayers) {
+		a.closeTable(ctx, game, prefix+"牌桌剩余人数不足，自动结束。")
+		return
+	}
+	if err != nil {
+		a.send(game.ChatID, "开始下一手失败："+err.Error(), nil)
+		return
+	}
+	deadline := time.Now().Add(time.Duration(game.ActionSeconds) * time.Second)
+	if err := a.store.SaveRunningGame(ctx, game, deadline, 0, "hand_started", "{}"); err != nil {
+		a.send(game.ChatID, "保存牌局失败："+err.Error(), nil)
+		return
+	}
+	a.send(game.ChatID, prefix+fmt.Sprintf("第 %d 手开始！\n", game.HandNo)+gameText(game, deadline.In(a.cfg.Location)), actionKeyboard(game))
 }
 
 func (a *App) deadlineLoop(ctx context.Context) {
@@ -503,13 +604,16 @@ func (a *App) handleDeadlines(ctx context.Context) {
 		lock.Lock()
 		fresh, err := a.store.ActiveGame(ctx, active.Game.ChatID)
 		if err == nil && fresh.Game != nil && fresh.Game.Status == poker.StatusRunning && !fresh.ActionDeadline.After(now) {
+			if fresh.Game.BetweenHands() {
+				a.startNextHand(ctx, fresh.Game)
+				lock.Unlock()
+				continue
+			}
 			result, err := fresh.Game.AutoAction()
 			if err != nil {
 				a.log.Error("auto action", "error", err)
 			} else if result.Finished {
-				if err := a.store.FinishGame(ctx, fresh.Game); err == nil {
-					a.send(fresh.Game.ChatID, strings.Join(result.Messages, "\n")+"\n"+settlementText(fresh.Game), nil)
-				}
+				a.finishHand(ctx, fresh.Game, strings.Join(result.Messages, "\n"))
 			} else {
 				deadline := time.Now().Add(time.Duration(fresh.Game.ActionSeconds) * time.Second)
 				if err := a.store.SaveRunningGame(ctx, fresh.Game, deadline, 0, "timeout", "{}"); err == nil {
@@ -559,8 +663,10 @@ func (a *App) answerCallback(id, text string, alert bool) {
 func (a *App) setCommands() {
 	commands := tgbotapi.NewSetMyCommands(
 		tgbotapi.BotCommand{Command: "newgame", Description: "创建牌局"},
-		tgbotapi.BotCommand{Command: "join", Description: "加入等待局"},
+		tgbotapi.BotCommand{Command: "join", Description: "加入牌局（买入）"},
+		tgbotapi.BotCommand{Command: "leave", Description: "离桌结算筹码"},
 		tgbotapi.BotCommand{Command: "begin", Description: "提前开局"},
+		tgbotapi.BotCommand{Command: "cancel", Description: "取消等待局/关闭牌桌"},
 		tgbotapi.BotCommand{Command: "balance", Description: "查询余额"},
 		tgbotapi.BotCommand{Command: "checkin", Description: "每日签到"},
 		tgbotapi.BotCommand{Command: "redeem", Description: "兑换充值码"},

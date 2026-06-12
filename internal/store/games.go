@@ -93,20 +93,43 @@ func (s *Store) SaveRunningGame(ctx context.Context, game *poker.Game, deadline 
 	return tx.Commit()
 }
 
-func (s *Store) FinishGame(ctx context.Context, game *poker.Game) error {
+// SettleHand 记录一手的抽水并保存牌局；deadline 是下一手自动开始时间。
+// 输赢只在玩家筹码间流转，余额要等离桌或关桌时按剩余筹码退还。
+func (s *Store) SettleHand(ctx context.Context, game *poker.Game, deadline time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	for _, award := range game.Awards {
-		if award.Net > 0 {
-			if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, award.UserID, game.ID, "payout", award.Net, award.Reason); err != nil {
+		if award.Fee > 0 {
+			if err := s.insertFeeTx(ctx, tx, game.ChatID, game.ID, award.Fee, "服务费"); err != nil {
 				return err
 			}
 		}
-		if award.Fee > 0 {
-			if err := s.insertFeeTx(ctx, tx, game.ChatID, game.ID, award.Fee, "服务费"); err != nil {
+	}
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, deadline); err != nil {
+		return err
+	}
+	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
+		return err
+	}
+	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, 0, "hand_finished", "{}"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CloseGame 关闭牌桌，把每个玩家的剩余筹码退回余额。
+func (s *Store) CloseGame(ctx context.Context, game *poker.Game) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, p := range game.Players {
+		if p.Stack > 0 {
+			if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, p.UserID, game.ID, "cash_out", p.Stack, "牌桌结算退还筹码"); err != nil {
 				return err
 			}
 		}
@@ -118,6 +141,52 @@ func (s *Store) FinishGame(ctx context.Context, game *poker.Game) error {
 		return err
 	}
 	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, 0, "game_finished", "{}"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// JoinRunningGame 两手之间买入加入：扣买入并保存牌局。
+func (s *Store) JoinRunningGame(ctx context.Context, game *poker.Game, userID int64, deadline time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, userID, game.ID, "buy_in", -game.BuyIn, "牌局买入"); err != nil {
+		return err
+	}
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, deadline); err != nil {
+		return err
+	}
+	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
+		return err
+	}
+	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, userID, "player_joined", "{}"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// LeaveRunningGame 两手之间离桌：剩余筹码退回余额并保存牌局。
+func (s *Store) LeaveRunningGame(ctx context.Context, game *poker.Game, userID, stack int64, deadline time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if stack > 0 {
+		if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, userID, game.ID, "cash_out", stack, "离桌结算退还筹码"); err != nil {
+			return err
+		}
+	}
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, deadline); err != nil {
+		return err
+	}
+	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
+		return err
+	}
+	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, userID, "player_left", "{}"); err != nil {
 		return err
 	}
 	return tx.Commit()
