@@ -7,14 +7,12 @@ import (
 	"errors"
 	"time"
 
-	"texas-holdem/internal/blackjack"
 	"texas-holdem/internal/poker"
 )
 
-const (
-	GameTypeHoldem    = "holdem"
-	GameTypeBlackjack = "blackjack"
-)
+// GameTypeHoldem 写入 games.game_type 列；历史库中可能存在 'blackjack' 行
+// （21 点已拆分至独立仓库），查询时一律过滤掉。
+const GameTypeHoldem = "holdem"
 
 func (s *Store) CreateWaitingGame(ctx context.Context, game *poker.Game, deadline time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -25,7 +23,7 @@ func (s *Store) CreateWaitingGame(ctx context.Context, game *poker.Game, deadlin
 	if err := s.assertNoActiveGameTx(ctx, tx, game.ChatID); err != nil {
 		return err
 	}
-	if err := s.insertOrUpdateGameTx(ctx, tx, GameTypeHoldem, game, 0, deadline); err != nil {
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, deadline); err != nil {
 		return err
 	}
 	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
@@ -43,7 +41,7 @@ func (s *Store) SaveWaitingGame(ctx context.Context, game *poker.Game, waitingMe
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.insertOrUpdateGameTx(ctx, tx, GameTypeHoldem, game, waitingMessageID, deadline); err != nil {
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, waitingMessageID, deadline); err != nil {
 		return err
 	}
 	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
@@ -63,7 +61,7 @@ func (s *Store) BeginGame(ctx context.Context, game *poker.Game, deadline time.T
 			return err
 		}
 	}
-	if err := s.insertOrUpdateGameTx(ctx, tx, GameTypeHoldem, game, 0, deadline); err != nil {
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, deadline); err != nil {
 		return err
 	}
 	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
@@ -81,7 +79,7 @@ func (s *Store) SaveRunningGame(ctx context.Context, game *poker.Game, deadline 
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.insertOrUpdateGameTx(ctx, tx, GameTypeHoldem, game, 0, deadline); err != nil {
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, deadline); err != nil {
 		return err
 	}
 	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
@@ -113,7 +111,7 @@ func (s *Store) FinishGame(ctx context.Context, game *poker.Game) error {
 			}
 		}
 	}
-	if err := s.insertOrUpdateGameTx(ctx, tx, GameTypeHoldem, game, 0, time.Time{}); err != nil {
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, time.Time{}); err != nil {
 		return err
 	}
 	if err := s.replacePlayersTx(ctx, tx, game); err != nil {
@@ -135,7 +133,7 @@ func (s *Store) CancelWaitingGame(ctx context.Context, game *poker.Game, userID 
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.insertOrUpdateGameTx(ctx, tx, GameTypeHoldem, game, 0, time.Time{}); err != nil {
+	if err := s.insertOrUpdateGameTx(ctx, tx, game, 0, time.Time{}); err != nil {
 		return err
 	}
 	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, userID, "game_canceled", "{}"); err != nil {
@@ -144,151 +142,27 @@ func (s *Store) CancelWaitingGame(ctx context.Context, game *poker.Game, userID 
 	return tx.Commit()
 }
 
-func (s *Store) CreateWaitingBlackjack(ctx context.Context, game *blackjack.Game, deadline time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := s.assertNoActiveGameTx(ctx, tx, game.ChatID); err != nil {
-		return err
-	}
-	if err := s.insertOrUpdateBlackjackTx(ctx, tx, game, 0, deadline); err != nil {
-		return err
-	}
-	if err := s.replaceBlackjackPlayersTx(ctx, tx, game); err != nil {
-		return err
-	}
-	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, game.CreatorID, "blackjack_created", "{}"); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Store) SaveWaitingBlackjack(ctx context.Context, game *blackjack.Game, waitingMessageID int, deadline time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := s.insertOrUpdateBlackjackTx(ctx, tx, game, waitingMessageID, deadline); err != nil {
-		return err
-	}
-	if err := s.replaceBlackjackPlayersTx(ctx, tx, game); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Store) BeginBlackjack(ctx context.Context, game *blackjack.Game, deadline time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, p := range game.Players {
-		if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, p.UserID, game.ID, "blackjack_bet", -p.Bet, "21点下注"); err != nil {
-			return err
-		}
-	}
-	if err := s.insertOrUpdateBlackjackTx(ctx, tx, game, 0, deadline); err != nil {
-		return err
-	}
-	if err := s.replaceBlackjackPlayersTx(ctx, tx, game); err != nil {
-		return err
-	}
-	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, game.CreatorID, "blackjack_started", "{}"); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Store) SaveRunningBlackjack(ctx context.Context, game *blackjack.Game, deadline time.Time, actorID int64, kind string, payload string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := s.insertOrUpdateBlackjackTx(ctx, tx, game, 0, deadline); err != nil {
-		return err
-	}
-	if err := s.replaceBlackjackPlayersTx(ctx, tx, game); err != nil {
-		return err
-	}
-	if kind != "" {
-		if err := s.eventTx(ctx, tx, game.ID, game.ChatID, actorID, kind, payload); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-func (s *Store) FinishBlackjack(ctx context.Context, game *blackjack.Game) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, award := range game.Awards {
-		if award.Payout > 0 {
-			if _, err := s.adjustBalanceTx(ctx, tx, game.ChatID, award.UserID, game.ID, "blackjack_payout", award.Payout, award.Reason); err != nil {
-				return err
-			}
-		}
-	}
-	if err := s.insertOrUpdateBlackjackTx(ctx, tx, game, 0, time.Time{}); err != nil {
-		return err
-	}
-	if err := s.replaceBlackjackPlayersTx(ctx, tx, game); err != nil {
-		return err
-	}
-	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, 0, "blackjack_finished", "{}"); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Store) CancelWaitingBlackjack(ctx context.Context, game *blackjack.Game, userID int64) error {
-	if game.Status != blackjack.StatusWaiting {
-		return errors.New("只能取消等待中的牌局")
-	}
-	game.Status = blackjack.StatusCanceled
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := s.insertOrUpdateBlackjackTx(ctx, tx, game, 0, time.Time{}); err != nil {
-		return err
-	}
-	if err := s.eventTx(ctx, tx, game.ID, game.ChatID, userID, "blackjack_canceled", "{}"); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 func (s *Store) ActiveGame(ctx context.Context, chatID int64) (ActiveGame, error) {
-	var gameType string
 	var state string
 	var waitingMessageID int
 	var deadline sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-SELECT game_type, state_json, waiting_message_id, action_deadline
+SELECT state_json, waiting_message_id, action_deadline
 FROM games
-WHERE chat_id = ? AND status IN ('waiting', 'running')
+WHERE chat_id = ? AND game_type = 'holdem' AND status IN ('waiting', 'running')
 ORDER BY created_at DESC
-LIMIT 1`, chatID).Scan(&gameType, &state, &waitingMessageID, &deadline)
+LIMIT 1`, chatID).Scan(&state, &waitingMessageID, &deadline)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ActiveGame{}, ErrNotFound
 	}
 	if err != nil {
 		return ActiveGame{}, err
 	}
-	out, err := decodeActiveGame(gameType, state)
-	if err != nil {
+	var game poker.Game
+	if err := json.Unmarshal([]byte(state), &game); err != nil {
 		return ActiveGame{}, err
 	}
-	out.WaitingMessageID = waitingMessageID
+	out := ActiveGame{Game: &game, WaitingMessageID: waitingMessageID}
 	if deadline.Valid && deadline.String != "" {
 		t, err := time.Parse(time.RFC3339, deadline.String)
 		if err == nil {
@@ -300,25 +174,25 @@ LIMIT 1`, chatID).Scan(&gameType, &state, &waitingMessageID, &deadline)
 
 func (s *Store) RunningGames(ctx context.Context) ([]ActiveGame, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT game_type, state_json, action_deadline
+SELECT state_json, action_deadline
 FROM games
-WHERE status = 'running'`)
+WHERE game_type = 'holdem' AND status = 'running'`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []ActiveGame
 	for rows.Next() {
-		var gameType string
 		var state string
 		var deadline sql.NullString
-		if err := rows.Scan(&gameType, &state, &deadline); err != nil {
+		if err := rows.Scan(&state, &deadline); err != nil {
 			return nil, err
 		}
-		item, err := decodeActiveGame(gameType, state)
-		if err != nil {
+		var game poker.Game
+		if err := json.Unmarshal([]byte(state), &game); err != nil {
 			return nil, err
 		}
+		item := ActiveGame{Game: &game}
 		if deadline.Valid && deadline.String != "" {
 			t, err := time.Parse(time.RFC3339, deadline.String)
 			if err == nil {
@@ -332,27 +206,26 @@ WHERE status = 'running'`)
 
 func (s *Store) WaitingGamesDue(ctx context.Context, now time.Time) ([]ActiveGame, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT game_type, state_json, waiting_message_id, action_deadline
+SELECT state_json, waiting_message_id, action_deadline
 FROM games
-WHERE status = 'waiting' AND action_deadline IS NOT NULL AND action_deadline <= ?`, now.UTC().Format(time.RFC3339))
+WHERE game_type = 'holdem' AND status = 'waiting' AND action_deadline IS NOT NULL AND action_deadline <= ?`, now.UTC().Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []ActiveGame
 	for rows.Next() {
-		var gameType string
 		var state string
 		var waitingMessageID int
 		var deadline sql.NullString
-		if err := rows.Scan(&gameType, &state, &waitingMessageID, &deadline); err != nil {
+		if err := rows.Scan(&state, &waitingMessageID, &deadline); err != nil {
 			return nil, err
 		}
-		item, err := decodeActiveGame(gameType, state)
-		if err != nil {
+		var game poker.Game
+		if err := json.Unmarshal([]byte(state), &game); err != nil {
 			return nil, err
 		}
-		item.WaitingMessageID = waitingMessageID
+		item := ActiveGame{Game: &game, WaitingMessageID: waitingMessageID}
 		if deadline.Valid && deadline.String != "" {
 			t, err := time.Parse(time.RFC3339, deadline.String)
 			if err == nil {
@@ -365,18 +238,18 @@ WHERE status = 'waiting' AND action_deadline IS NOT NULL AND action_deadline <= 
 }
 
 func (s *Store) assertNoActiveGameTx(ctx context.Context, tx *sql.Tx, chatID int64) error {
-	var id string
-	err := tx.QueryRowContext(ctx, `SELECT id FROM games WHERE chat_id = ? AND status IN ('waiting', 'running') LIMIT 1`, chatID).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
+	var count int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM games WHERE chat_id = ? AND game_type = 'holdem' AND status IN ('waiting', 'running')`, chatID).Scan(&count)
 	if err != nil {
 		return err
+	}
+	if count == 0 {
+		return nil
 	}
 	return errors.New("本群已有等待中或进行中的牌局")
 }
 
-func (s *Store) insertOrUpdateGameTx(ctx context.Context, tx *sql.Tx, gameType string, game *poker.Game, waitingMessageID int, deadline time.Time) error {
+func (s *Store) insertOrUpdateGameTx(ctx context.Context, tx *sql.Tx, game *poker.Game, waitingMessageID int, deadline time.Time) error {
 	state, err := json.Marshal(game)
 	if err != nil {
 		return err
@@ -395,32 +268,8 @@ ON CONFLICT(id) DO UPDATE SET
   waiting_message_id = CASE WHEN excluded.waiting_message_id = 0 THEN games.waiting_message_id ELSE excluded.waiting_message_id END,
   action_deadline = excluded.action_deadline,
   updated_at = CURRENT_TIMESTAMP`,
-		game.ID, gameType, game.ChatID, game.CreatorID, game.Status, game.SmallBlind, game.BigBlind, game.BuyIn,
+		game.ID, GameTypeHoldem, game.ChatID, game.CreatorID, game.Status, game.SmallBlind, game.BigBlind, game.BuyIn,
 		game.WaitSeconds, game.ActionSeconds, game.RakePercent, game.RakeCap, string(state), waitingMessageID, deadlineValue)
-	return err
-}
-
-func (s *Store) insertOrUpdateBlackjackTx(ctx context.Context, tx *sql.Tx, game *blackjack.Game, waitingMessageID int, deadline time.Time) error {
-	state, err := json.Marshal(game)
-	if err != nil {
-		return err
-	}
-	var deadlineValue any
-	if !deadline.IsZero() {
-		deadlineValue = deadline.UTC().Format(time.RFC3339)
-	}
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO games(id, game_type, chat_id, creator_id, status, small_blind, big_blind, buy_in, wait_seconds, action_seconds, rake_percent, rake_cap, state_json, waiting_message_id, action_deadline, updated_at)
-VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 0, 0, ?, ?, ?, CURRENT_TIMESTAMP)
-ON CONFLICT(id) DO UPDATE SET
-  game_type = excluded.game_type,
-  status = excluded.status,
-  state_json = excluded.state_json,
-  waiting_message_id = CASE WHEN excluded.waiting_message_id = 0 THEN games.waiting_message_id ELSE excluded.waiting_message_id END,
-  action_deadline = excluded.action_deadline,
-  updated_at = CURRENT_TIMESTAMP`,
-		game.ID, GameTypeBlackjack, game.ChatID, game.CreatorID, game.Status, game.Bet,
-		game.WaitSeconds, game.ActionSeconds, string(state), waitingMessageID, deadlineValue)
 	return err
 }
 
@@ -436,42 +285,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`, game.ID, game.ChatID, p.UserID, p.Seat, p.Display
 		}
 	}
 	return nil
-}
-
-func (s *Store) replaceBlackjackPlayersTx(ctx context.Context, tx *sql.Tx, game *blackjack.Game) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM game_players WHERE game_id = ?`, game.ID); err != nil {
-		return err
-	}
-	for _, p := range game.Players {
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO game_players(game_id, chat_id, user_id, seat, display_name, stack, status)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, game.ID, game.ChatID, p.UserID, p.Seat, p.Display, p.Bet, p.Status); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func decodeActiveGame(gameType string, state string) (ActiveGame, error) {
-	if gameType == "" {
-		gameType = GameTypeHoldem
-	}
-	switch gameType {
-	case GameTypeHoldem:
-		var game poker.Game
-		if err := json.Unmarshal([]byte(state), &game); err != nil {
-			return ActiveGame{}, err
-		}
-		return ActiveGame{Type: GameTypeHoldem, Game: &game}, nil
-	case GameTypeBlackjack:
-		var game blackjack.Game
-		if err := json.Unmarshal([]byte(state), &game); err != nil {
-			return ActiveGame{}, err
-		}
-		return ActiveGame{Type: GameTypeBlackjack, Blackjack: &game}, nil
-	default:
-		return ActiveGame{}, errors.New("未知牌局类型")
-	}
 }
 
 func (s *Store) eventTx(ctx context.Context, tx *sql.Tx, gameID string, chatID, userID int64, kind string, payload string) error {
