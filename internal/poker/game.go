@@ -133,12 +133,31 @@ func (g *Game) RemovePlayer(userID int64) (Player, error) {
 	if idx < 0 {
 		return Player{}, errors.New("你不在本局中")
 	}
+	dealerUserID := int64(0)
+	if g.Dealer >= 0 && g.Dealer < len(g.Players) {
+		dealerUserID = g.Players[g.Dealer].UserID
+	}
 	removed := g.Players[idx]
 	g.Players = append(g.Players[:idx], g.Players[idx+1:]...)
 	for i := range g.Players {
 		g.Players[i].Seat = i
 	}
+	g.reanchorDealerAfterRemove(idx, removed.UserID, dealerUserID)
 	return removed, nil
+}
+
+func (g *Game) reanchorDealerAfterRemove(removedIdx int, removedUserID, dealerUserID int64) {
+	if len(g.Players) == 0 {
+		g.Dealer = 0
+		return
+	}
+	if removedUserID == dealerUserID {
+		g.Dealer = (removedIdx - 1 + len(g.Players)) % len(g.Players)
+		return
+	}
+	if idx := g.findPlayer(dealerUserID); idx >= 0 {
+		g.Dealer = idx
+	}
 }
 
 func (g *Game) Start() error {

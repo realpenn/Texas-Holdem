@@ -175,6 +175,43 @@ func TestMultiHandRotationAndBrokeRemoval(t *testing.T) {
 	}
 }
 
+func TestRemovePlayerBetweenHandsPreservesDealerRotation(t *testing.T) {
+	tests := []struct {
+		name       string
+		removeUser int64
+		wantDealer int64
+	}{
+		{name: "player before dealer leaves", removeUser: 2, wantDealer: 4},
+		{name: "dealer leaves", removeUser: 3, wantDealer: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			game := NewGame(Settings{ID: "g1", ChatID: 1, SmallBlind: 50, BigBlind: 100, BuyIn: 1000})
+			for i := int64(1); i <= 4; i++ {
+				if err := game.AddPlayer(i, fmt.Sprintf("P%d", i)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			game.Status = StatusRunning
+			game.Street = StreetDone
+			game.CurrentTurn = -1
+			game.Dealer = 2
+			for i := range game.Players {
+				game.Players[i].Stack = 1000
+			}
+			if _, err := game.RemovePlayer(tt.removeUser); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := game.StartNextHand(); err != nil {
+				t.Fatal(err)
+			}
+			if got := game.Players[game.Dealer].UserID; got != tt.wantDealer {
+				t.Fatalf("dealer user = %d, want %d", got, tt.wantDealer)
+			}
+		})
+	}
+}
+
 func TestStartNextHandClosesWhenOnePlayerLeft(t *testing.T) {
 	game := NewGame(Settings{ID: "g1", ChatID: 1, SmallBlind: 50, BigBlind: 100, BuyIn: 1000})
 	_ = game.AddPlayer(1, "A")

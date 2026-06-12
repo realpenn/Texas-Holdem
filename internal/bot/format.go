@@ -130,7 +130,7 @@ func raiseRow(game *poker.Game, current *poker.Player) []tgbotapi.InlineKeyboard
 		{"半池", potAfterCall / 2},
 		{"满池", potAfterCall},
 	} {
-		target := game.CurrentBet + toCall + opt.extra
+		target := game.CurrentBet + opt.extra
 		if target <= minTo || target >= maxTo {
 			continue
 		}
