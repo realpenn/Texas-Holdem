@@ -12,9 +12,7 @@ go run ./cmd/bot
 
 ## 主要命令
 
-- `/newgame` 选择创建德州扑克或 21 点
-- `/newgame holdem [sb] [bb] [buyin] [wait_seconds]` 直接创建德州牌局
-- `/newgame blackjack [bet] [wait_seconds]` 直接创建 21 点牌局
+- `/newgame [sb] [bb] [buyin] [wait_seconds]` 创建牌局
 - `/join` 加入等待局
 - `/leave` 离开等待局
 - `/begin` 发起人提前开局
@@ -23,7 +21,9 @@ go run ./cmd/bot
 - `/checkin` 每日签到
 - `/redeem CODE` 兑换充值码
 
-牌局行动通过群内按钮完成。21 点默认下注使用 `DEFAULT_BIG_BLIND`。
+牌局行动通过群内按钮完成。
+
+21 点玩法已拆分至独立仓库 [realpenn/Blackjack](https://github.com/realpenn/Blackjack)。
 
 充值码只按总次数限制；只要次数没用完，同一用户可以重复兑换同一个充值码。
 
